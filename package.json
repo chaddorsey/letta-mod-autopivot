@@ -1,0 +1,60 @@
+{
+  "name": "letta-mod-autopivot",
+  "version": "0.1.0",
+  "description": "AutoPivot — condition-aware model switching + offline profile for Letta Code local-backend (and Constellation) agents.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "dist/",
+    "index.mjs",
+    "configure.mjs",
+    "lib/",
+    "autopivot.config.example.json",
+    "MOD.md",
+    "README.md"
+  ],
+  "bin": {
+    "autopivot-configure": "./configure.mjs"
+  },
+  "letta": {
+    "manifestVersion": 1,
+    "mods": [
+      "dist/autopivot.mjs"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build:mod": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=dist/autopivot.mjs",
+    "build:configure": "esbuild configure.mjs --bundle --platform=node --format=cjs --outfile=dist/autopivot-configure.cjs",
+    "build": "npm run build:mod && npm run build:configure",
+    "configure": "node configure.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "lettaCode": {
+    "minVersion": "0.27.18",
+    "entry": "index.mjs",
+    "command": "pivot"
+  },
+  "keywords": [
+    "letta-package",
+    "letta-mod",
+    "letta",
+    "letta-code",
+    "llm",
+    "model-routing",
+    "failover",
+    "offline"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^8.5.2"
+  }
+}
