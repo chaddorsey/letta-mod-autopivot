@@ -1,6 +1,6 @@
 {
   "name": "letta-mod-autopivot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AutoPivot — condition-aware model switching + offline profile for Letta Code local-backend (and Constellation) agents.",
   "type": "module",
   "main": "index.mjs",

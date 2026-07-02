@@ -26,6 +26,7 @@ import { resolveLadder, buildRungs } from "./lib/resolver.mjs";
 import { makeFailureSeam } from "./lib/failure-seam.mjs";
 import { makeStallWatch } from "./lib/failure-watch.mjs";
 import { modelToRungIndex, canSuspend } from "./lib/suspension.mjs";
+import { classifyLlmEnd, describeReason } from "./lib/llm-end.mjs";
 import { decideTurn, injectNote, buildHonestyNote } from "./lib/turn.mjs";
 import { renderPill, metricSegment } from "./lib/statusline.mjs";
 import { buildStatusText } from "./lib/status.mjs";
@@ -99,12 +100,16 @@ export default async function activate(letta) {
   const engine = makeEngine([manual, reachability, network, ...rungProbes.values()]);
   const seam = makeMemfsSeam(config.memorySync, letta.memorySync);
 
-  // --- Phase 3a: stall-based failure detection → rung suspension ---------------
+  // --- failure detection → rung suspension -------------------------------------
   // A rung can be REACHABLE yet fail the completion (rate-limit / no-credit / auth /
-  // overflow). The only in-band signal is an unmatched `llm_start` (probe-verified), so
-  // a stall watchdog is the detector. It feeds a swappable FAILURE SEAM (a future
-  // `provider_error` event would feed the same seam). `suspended` is ephemeral (reset on
-  // /reload): rungIndex → { count, timer }.
+  // overflow). TWO detectors feed one swappable FAILURE SEAM:
+  //   1. llm_end error (letta-code 0.27.20+, PR #3164) — structured error on the event →
+  //      near-instant failover. This is the `provider_error`-shaped signal the seam was
+  //      built for; it plugged in with zero consumer rework. See lib/llm-end.mjs.
+  //   2. stall watchdog — on 0.27.18/0.27.19 a failed request emits NO llm_end at all
+  //      (probe-verified), so an unmatched `llm_start` past a timeout is the only signal.
+  //      Still the backstop for a true hang (no llm_end ever) on any version.
+  // `suspended` is ephemeral (reset on /reload): rungIndex → { count }.
   const stallCfg = config.stall;
   const suspended = new Map();
   const suspendedSet = () => new Set(suspended.keys());
@@ -136,18 +141,20 @@ export default async function activate(letta) {
   // a later completion on it succeeds. This is what prevents the bounce back to a
   // still-broken rung (and keeps the never-strand guard honest — a suspended rung stays
   // counted, so the fallback can't be suspended out from under us).
-  disposers.push(failSeam.onFailure(({ rungId: model }) => {
+  disposers.push(failSeam.onFailure(({ rungId: model, reason }) => {
     try {
       const idx = modelToRungIndex(rungs, model);
       if (idx == null) return; // off-ladder or mid-switch → don't suspend the wrong rung
       if (suspended.has(idx)) return; // already suspended → nothing to do
+      // When 0.27.20+ hands us a structured error, tell the user what actually broke.
+      const why = reason && typeof reason === "object" ? ` (${describeReason(reason)})` : "";
       if (!canSuspend(rungs.length, suspendedSet(), idx)) {
-        announce(`⚠️ AutoPivot: all rungs failing — staying on ${model}. Run /pivot online to retry.`);
+        announce(`⚠️ AutoPivot: all rungs failing${why} — staying on ${model}. Run /pivot online to retry.`);
         return;
       }
       suspended.set(idx, { count: (suspended.get(idx)?.count ?? 0) + 1 });
       const next = computeView(null).desired;
-      announce(`⚠️ AutoPivot: ${model} failed → now on ${next ?? "(no model)"}. Resend your message; /pivot online to retry.`);
+      announce(`⚠️ AutoPivot: ${model} failed${why} → now on ${next ?? "(no model)"}. Resend your message; /pivot online to retry.`);
       try { updateUi(); } catch { /* ignore */ }
     } catch (e) { log(`suspend: ${e?.message ?? e}`); }
   }));
@@ -287,11 +294,14 @@ export default async function activate(letta) {
     ["llm_end", (event, ctx) => {
       stallWatch.markSettled(cidOf(event, ctx));
       const model = event?.model ?? ctx?.model?.id;
-      const sr = event?.stopReason;
-      // Opportunistic FAST PATH: if the failure surfaces as a final error message, report
-      // it immediately (near-instant failover) instead of waiting for the stall timeout.
-      // Smoke-gated — the probe capture saw no llm_end on a 401, so this may never fire.
-      if (sr === "error" || sr === "aborted") { try { failSeam.report(model, "error"); } catch { /* ignore */ } }
+      // FAST PATH (letta-code 0.27.20+, PR #3164): llm_end now fires on FAILURE too,
+      // carrying a structured `error` (errorType + message + retryable) with `usage:null`.
+      // classifyLlmEnd reads it → we fail over IMMEDIATELY instead of waiting out the stall
+      // watchdog. On 0.27.18/0.27.19 there's no error field (a failed request emits no
+      // llm_end), so this cleanly degrades to "benign end = success" and the watchdog stays
+      // the detector. See lib/llm-end.mjs.
+      const { failed, reason } = classifyLlmEnd(event);
+      if (failed) { try { failSeam.report(model, reason); } catch { /* ignore */ } }
       else noteSuccess(model); // a clean completion clears any suspension on this rung
     }],
     ["turn_end", (event, ctx) => { stallWatch.markSettled(cidOf(event, ctx)); }],
