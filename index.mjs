@@ -25,6 +25,7 @@ import { makeEngine } from "./lib/engine.mjs";
 import { resolveLadder, buildRungs } from "./lib/resolver.mjs";
 import { makeFailureSeam } from "./lib/failure-seam.mjs";
 import { makeStallWatch } from "./lib/failure-watch.mjs";
+import * as fsMod from "node:fs";
 import { modelToRungIndex, canSuspend } from "./lib/suspension.mjs";
 import { classifyRateLimit } from "./lib/rate-limit.mjs";
 import { classifyLlmEnd, describeReason } from "./lib/llm-end.mjs";
@@ -58,9 +59,51 @@ const CONFIGURE_PATH = (() => {
 
 export default async function activate(letta) {
   const disposers = [];
-  const log = (m) => { try { letta.log?.(`autopivot: ${m}`); } catch { /* no logger */ } };
+  // letta.log goes to a per-agent debug log that is off by default, which is why
+  // 284 restarts and a day of failovers left no trace anywhere an operator looks.
+  // Mirror to a file we control. Cheap, append-only, and the ONLY way to see what
+  // this mod decided.
+  const traceFile = () => {
+    try {
+      const home = globalThis.process?.env?.HOME;
+      return home ? `${home}/Library/Logs/autopivot.log` : null;
+    } catch { return null; }
+  };
+  const trace = (m) => {
+    try {
+      const f = traceFile();
+      if (!f) return;
+      // Lazily imported so a bundler/runtime without fs still loads the mod.
+      globalThis.__autopivotFs ??= fsMod;
+      globalThis.__autopivotFs.appendFileSync(f, `[${new Date().toISOString()}] ${m}\n`);
+    } catch { /* never fatal */ }
+  };
+  const log = (m) => {
+    try { letta.log?.(`autopivot: ${m}`); } catch { /* no logger */ }
+    trace(m);
+  };
 
   const { config, warnings } = await loadConfig(CONFIG_PATH);
+  log(`activate: pid=${globalThis.process?.pid} argv=${(globalThis.process?.argv ?? []).slice(1).join(" ")}`);
+  // The host declares which event families it actually emits. llm_start/llm_end
+  // only fire where provider requests run client-side; a surface that does them
+  // elsewhere registers the handler and never calls it, which is indistinguishable
+  // from "nothing ever failed".
+  try {
+    log(`capabilities: ${JSON.stringify(letta.capabilities ?? null)}`);
+  } catch (e) { log(`capabilities unreadable: ${e?.message ?? e}`); }
+  // THE failure detector depends on llm_start/llm_end, which only fire where
+  // provider requests run client-side. Behind an App Server they do not, and
+  // `events.on` still ACCEPTS the handler — so the mod looks installed, healthy
+  // and armed while nothing can ever reach it. Say it out loud instead: an
+  // operator debugging "why didn't it fail over" should not have to discover
+  // this by instrumenting the mod, as happened on 2026-09-03.
+  const llmEvents = letta.capabilities?.events?.llm;
+  if (llmEvents === false) {
+    log("DEGRADED: this host does not emit llm_start/llm_end (capabilities.events.llm=false). " +
+        "Completion-failure detection — rate limits, auth failures, stalls — CANNOT run here. " +
+        "The reachability ladder still works; failover on a failed completion does not.");
+  }
   for (const w of warnings) log(w);
 
   const state = await loadState(STATE_PATH);
@@ -399,6 +442,7 @@ export default async function activate(letta) {
   const cidOf = (event, ctx) => ctx?.conversation?.id ?? event?.conversationId ?? ctx?.conversationId ?? "default";
   for (const [name, handler] of [
     ["llm_start", (event, ctx) => {
+      log(`llm_start model=${event?.model ?? ctx?.model?.id ?? "-"}`);
       stallWatch.markStart({ callId: cidOf(event, ctx), model: event?.model ?? ctx?.model?.id,
                             agentKey: agentPrimary(config, agentIdentity(ctx)).key });
       try { panel?.update?.(); } catch { /* ignore */ }
@@ -414,12 +458,14 @@ export default async function activate(letta) {
       // the detector. See lib/llm-end.mjs.
       const agentKey = agentPrimary(config, agentIdentity(ctx)).key;
       const { failed, reason } = classifyLlmEnd(event);
+      log(`llm_end model=${model} agent=${agentKey ?? "-"} failed=${failed} ` +
+          `stopReason=${event?.stopReason ?? "-"} reason=${JSON.stringify(reason)?.slice(0, 160)}`);
       if (failed) { try { failSeam.report(model, reason, agentKey); } catch { /* ignore */ } }
       else noteSuccess(model, agentKey); // a clean completion clears this agent's suspension
     }],
-    ["turn_end", (event, ctx) => { stallWatch.markSettled(cidOf(event, ctx)); }],
+    ["turn_end", (event, ctx) => { log("turn_end"); stallWatch.markSettled(cidOf(event, ctx)); }],
   ]) {
-    try { disposers.push(letta.events.on(name, handler)); }
+    try { disposers.push(letta.events.on(name, handler)); log(`registered handler: ${name}`); }
     catch (e) { log(`event ${name} unavailable: ${e?.message ?? e}`); }
   }
 
