@@ -228,3 +228,25 @@ test("manual online warns when the forced primary is suspended", () => {
   assert.equal(r.model, "anthropic/primary"); // user choice still trumps
   assert.match(r.warning, /unreachable/i);
 });
+
+test("per-agent rungs get their OWN probe ids", () => {
+  // Two agents' rung 1 are different models. Sharing a probe id would make one
+  // agent's fallback health decide the other's — the same conflation that made
+  // rung indices meaningless across agents.
+  const rule = {
+    condition: "reachability",
+    target: { model: "M" },
+    reachability: { probeUrl: "https://example.test/v1/models" },
+  };
+  const globalRungs = buildRungs("P", [rule]);
+  const agentRungs = buildRungs("P", [rule], { probeNamespace: "agent:agent-1" });
+  assert.equal(globalRungs[1].probeId, "rung:0");
+  assert.equal(agentRungs[1].probeId, "agent:agent-1:0");
+  assert.notEqual(globalRungs[1].probeId, agentRungs[1].probeId);
+});
+
+test("a probe-less cloud rung still inherits the brain probe under a namespace", () => {
+  const rungs = buildRungs("P", [{ condition: "reachability", target: { model: "M" } }],
+                           { probeNamespace: "agent:x" });
+  assert.equal(rungs[1].probeId, "reachability");
+});

@@ -18,7 +18,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { loadConfig, parseConfig } from "./lib/config.mjs";
+import { loadConfig, parseConfig, agentPrimary } from "./lib/config.mjs";
 import { discoverModels, buildStarterConfig } from "./lib/configure-core.mjs";
 import { makeReachabilityCondition, makeManualCondition, makeProbeCondition } from "./lib/conditions.mjs";
 import { makeEngine } from "./lib/engine.mjs";
@@ -26,6 +26,7 @@ import { resolveLadder, buildRungs } from "./lib/resolver.mjs";
 import { makeFailureSeam } from "./lib/failure-seam.mjs";
 import { makeStallWatch } from "./lib/failure-watch.mjs";
 import { modelToRungIndex, canSuspend } from "./lib/suspension.mjs";
+import { classifyRateLimit } from "./lib/rate-limit.mjs";
 import { classifyLlmEnd, describeReason } from "./lib/llm-end.mjs";
 import { decideTurn, injectNote, buildHonestyNote } from "./lib/turn.mjs";
 import { renderPill, metricSegment } from "./lib/statusline.mjs";
@@ -85,12 +86,23 @@ export default async function activate(letta) {
   // one is the always-available terminus. Build the per-rung probes here and a live
   // health map for resolveLadder.
   const rungs = buildRungs(config.primary, config.rules);
-  const rungProbes = new Map(); // probeId ("rung:<i>") → probe condition
-  config.rules.forEach((rule, i) => {
-    if (rule?.reachability?.probeUrl) {
-      rungProbes.set(`rung:${i}`, makeProbeCondition(`rung:${i}`, rule.reachability, { onProbe: () => { try { updateUi(); } catch { /* ignore */ } } }));
-    }
-  });
+  const rungProbes = new Map(); // probeId → probe condition
+  const addRungProbes = (rules, ns) => {
+    (rules ?? []).forEach((rule, i) => {
+      if (!rule?.reachability?.probeUrl) return;
+      const id = `${ns}:${i}`;
+      if (rungProbes.has(id)) return;
+      rungProbes.set(id, makeProbeCondition(id, rule.reachability, { onProbe: () => { try { updateUi(); } catch { /* ignore */ } } }));
+    });
+  };
+  addRungProbes(config.rules, "rung");
+  // Per-agent ladders get their OWN probe ids, built once here at activate rather
+  // than per turn: probes carry timers and state, and rebuilding them each turn
+  // would restart every backoff. Namespacing keeps two agents' rung 1 from
+  // sharing a health verdict when they are different models.
+  for (const [key, override] of Object.entries(config.agents ?? {})) {
+    if (Array.isArray(override?.rules)) addRungProbes(override.rules, `agent:${key}`);
+  }
   function healthMap() {
     const h = { reachability: reachability.isActive() ? "unreachable" : "available" };
     for (const [id, c] of rungProbes) h[id] = c.isActive() ? "unreachable" : "available";
@@ -109,10 +121,36 @@ export default async function activate(letta) {
   //   2. stall watchdog — on 0.27.18/0.27.19 a failed request emits NO llm_end at all
   //      (probe-verified), so an unmatched `llm_start` past a timeout is the only signal.
   //      Still the backstop for a true hang (no llm_end ever) on any version.
-  // `suspended` is ephemeral (reset on /reload): rungIndex → { count }.
+  // Keyed by AGENT, then rung index. Keying by index alone conflated agents:
+  // rung 0 is already per-agent, so suspending Kinara's rung 0 marked index 0
+  // suspended for the whole fleet and dropped every other agent off a healthy
+  // primary. Harmless while all agents shared one primary; live the moment
+  // per-agent overrides started resolving.
   const stallCfg = config.stall;
-  const suspended = new Map();
-  const suspendedSet = () => new Set(suspended.keys());
+  const suspended = new Map(); // agentKey → Map(rungIndex → { count, until })
+  const GLOBAL_AGENT = "__global__";
+  const bucket = (agentKey) => {
+    const k = agentKey ?? GLOBAL_AGENT;
+    let b = suspended.get(k);
+    if (!b) { b = new Map(); suspended.set(k, b); }
+    return b;
+  };
+  // Reading the set is also where timed suspensions expire. A rate-limited rung
+  // carries an `until`, and once the window closes it becomes eligible again on
+  // its own — recovery-by-success cannot do this, because a suspended rung is
+  // never given a turn to succeed on.
+  const suspendedSet = (agentKey) => {
+    const b = bucket(agentKey);
+    const now = Date.now();
+    for (const [idx, v] of [...b]) {
+      if (v?.until && now >= v.until) b.delete(idx);
+    }
+    return new Set(b.keys());
+  };
+  const anySuspended = () => {
+    for (const k of [...suspended.keys()]) if (suspendedSet(k).size > 0) return true;
+    return false;
+  };
   const failSeam = makeFailureSeam();
   // letta-code's llm_start/llm_end carry no per-call id and calls within a conversation
   // are sequential (tool loops = start→end→start→end), so we key by conversation id.
@@ -123,15 +161,33 @@ export default async function activate(letta) {
       if (!rung || rung.index === 0) return undefined;       // primary uses the global timeout
       return config.rules[rung.index - 1]?.stall?.timeoutMs; // per-rung override, if set
     },
-    onStall: (model) => { try { failSeam.report(model, "stall"); } catch { /* ignore */ } },
+    onStall: (model, agentKey) => { try { failSeam.report(model, "stall", agentKey); } catch { /* ignore */ } },
   });
 
-  const clearSuspension = (idx) => { suspended.delete(idx); };
+  const clearSuspension = (idx, agentKey) => { bucket(agentKey).delete(idx); };
+  /**
+   * The ladder as THIS agent sees it. Every suspension decision has to be made
+   * against the agent's own rungs, or an index means one model here and another
+   * there — which is the bug this keying replaced.
+   */
+  function ladderFor(agentKey) {
+    const override = agentKey ? config.agents?.[agentKey] : null;
+    if (!override) return rungs;
+    return buildRungs(
+      override.primary ?? config.primary,
+      override.rules ?? config.rules,
+      { probeNamespace: Array.isArray(override.rules) ? `agent:${agentKey}` : "rung" },
+    );
+  }
+
   // Recovery-by-success: a clean completion on a suspended rung clears it (e.g. after the
   // user /pivots back to it and it works).
-  function noteSuccess(model) {
-    const idx = modelToRungIndex(rungs, model);
-    if (idx != null && suspended.has(idx)) { clearSuspension(idx); try { updateUi(); } catch { /* ignore */ } }
+  function noteSuccess(model, agentKey) {
+    const idx = modelToRungIndex(ladderFor(agentKey), model);
+    if (idx != null && bucket(agentKey).has(idx)) {
+      clearSuspension(idx, agentKey);
+      try { updateUi(); } catch { /* ignore */ }
+    }
   }
 
   // Seam consumer: a rung failed → suspend it, unless that would strand the ladder
@@ -141,20 +197,37 @@ export default async function activate(letta) {
   // a later completion on it succeeds. This is what prevents the bounce back to a
   // still-broken rung (and keeps the never-strand guard honest — a suspended rung stays
   // counted, so the fallback can't be suspended out from under us).
-  disposers.push(failSeam.onFailure(({ rungId: model, reason }) => {
+  disposers.push(failSeam.onFailure(({ rungId: model, reason, agentKey }) => {
     try {
-      const idx = modelToRungIndex(rungs, model);
-      if (idx == null) return; // off-ladder or mid-switch → don't suspend the wrong rung
-      if (suspended.has(idx)) return; // already suspended → nothing to do
+      const ladder = ladderFor(agentKey);
+      const idx = modelToRungIndex(ladder, model);
+      if (idx == null) {
+        // Dropping this silently is how a real provider failure becomes no
+        // observable event at all. Suspending the wrong rung would be worse, so
+        // the drop stays — but it must be visible, because "model not on the
+        // ladder" is a CONFIG fault the operator can actually fix.
+        log(`failure for off-ladder model ${model} ignored (agent=${agentKey ?? "-"}; ladder: ${ladder.map((r) => r.model).join(", ")})`);
+        return;
+      }
+      if (bucket(agentKey).has(idx)) return; // already suspended → nothing to do
       // When 0.27.20+ hands us a structured error, tell the user what actually broke.
       const why = reason && typeof reason === "object" ? ` (${describeReason(reason)})` : "";
-      if (!canSuspend(rungs.length, suspendedSet(), idx)) {
+      if (!canSuspend(ladder.length, suspendedSet(agentKey), idx)) {
         announce(`⚠️ AutoPivot: all rungs failing${why} — staying on ${model}. Run /pivot online to retry.`);
         return;
       }
-      suspended.set(idx, { count: (suspended.get(idx)?.count ?? 0) + 1 });
-      const next = computeView(null).desired;
-      announce(`⚠️ AutoPivot: ${model} failed${why} → now on ${next ?? "(no model)"}. Resend your message; /pivot online to retry.`);
+      // A rate limit is a rung that is HEALTHY and temporarily refusing. It still
+      // gets suspended — you cannot use it — but with an expiry, so it returns by
+      // itself. Without one it would sit out until /pivot online, since the only
+      // other way back is a clean completion the suspension itself prevents.
+      const { rateLimited, resetsAt } = classifyRateLimit(reason);
+      bucket(agentKey).set(idx, { count: (bucket(agentKey).get(idx)?.count ?? 0) + 1, until: resetsAt ?? null });
+      const next = computeView(null, agentKey ? { id: agentKey } : {}).desired;
+      const backIn = resetsAt
+        ? ` ${model} returns automatically in ${Math.max(1, Math.round((resetsAt - Date.now()) / 1000))}s.`
+        : "";
+      const what = rateLimited ? "rate-limited" : "failed";
+      announce(`⚠️ AutoPivot: ${model} ${what}${why} → now on ${next ?? "(no model)"}.${backIn} Resend your message; /pivot online to retry.`);
       try { updateUi(); } catch { /* ignore */ }
     } catch (e) { log(`suspend: ${e?.message ?? e}`); }
   }));
@@ -177,9 +250,45 @@ export default async function activate(letta) {
 
   // LIVE view — recomputed on demand (no caching). `checking` is the retry window
   // (a flip is being confirmed); `desired` is AutoPivot's target model.
-  function computeView(activeModelId) {
+  /**
+   * Which agent is this turn for?
+   *
+   * The mod activates once per process but the App Server serves the whole fleet,
+   * so identity must come from the TURN, not from activate(). memfs.memoryDir is
+   * `~/.letta/agents/<agent-id>/memory`, which makes the id derivable without a
+   * new host capability; ctx.agent is preferred when the host offers it.
+   */
+  function agentIdentity(ctx) {
+    // TWO layouts, because the fleet moved and this regex did not:
+    //   Docker-era  ~/.letta/agents/<id>/memory
+    //   local       ~/.letta/lc-local-backend/memfs/<id>/memory
+    // Matching only `agents/` silently returned null for every LOCAL agent, so
+    // every per-agent override was dead and rung 0 was always the global
+    // primary. An agent running its own override was therefore OFF-LADDER, and
+    // an off-ladder failure is dropped — which is why a rate limit never failed
+    // over (observed 2026-09-02 and again 2026-09-03).
+    const id = ctx?.agent?.id
+      ?? (String(ctx?.memfs?.memoryDir ?? "").match(/(?:agents|memfs)\/([^/]+)/)?.[1] ?? null);
+    const name = ctx?.agent?.name ?? null;
+    return { id, name };
+  }
+
+  function computeView(activeModelId, identity = {}) {
     const mode = manual.mode();
-    const resolved = resolveLadder(rungs, healthMap(), { manualMode: mode, suspended: suspendedSet() });
+    // A per-agent override replaces rung 0 only; the rungs below stay global
+    // (see normalizeAgents). Rebuilding rung 0 per turn is cheap — buildRungs is
+    // a pure list construction, no probes are re-created.
+    const agentTop = agentPrimary(config, identity);
+    const effectiveRungs = (agentTop.primary === config.primary && !agentTop.ownRules)
+      ? rungs
+      : buildRungs(agentTop.primary, agentTop.rules, {
+          probeNamespace: agentTop.ownRules ? `agent:${agentTop.key}` : "rung",
+        });
+    const resolved = resolveLadder(effectiveRungs, healthMap(),
+      { manualMode: mode, suspended: suspendedSet(agentTop.key) });
+    if (agentTop.matched && resolved.modeLabel === "primary") {
+      resolved.perMode = { ...(resolved.perMode ?? {}), ...agentTop.perMode };
+    }
     const pendingInfo = mode === "auto" && reachability.isPending?.() ? reachability.pendingInfo() : null;
     let kind;
     if (mode === "offline") kind = "forced-offline";
@@ -188,13 +297,15 @@ export default async function activate(letta) {
     else if (resolved.kind === "none-reachable") kind = "none-reachable";
     // A stall-suspension is active and we failed over to a working rung → "on fallback"
     // (reassuring, not alarming). Only when auto and not otherwise none-reachable.
-    else if (mode === "auto" && suspended.size > 0) kind = "suspended";
+    else if (mode === "auto" && anySuspended()) kind = "suspended";
     else if (resolved.isDegraded) kind = "offline";
     else if (config.reachability.probeUrl && reachability.isStale(staleMs)) kind = "unknown";
     else kind = "online";
-    if (!config.primary) kind = "unconfigured"; // first-run: no primary set yet → run /pivot setup
-    const ruleSignifier = config.rules.find((x) => x.modeLabel === resolved.modeLabel)?.signifier ?? null;
-    return { kind, desired: resolved.model, actual: activeModelId, ruleSignifier, resolved, pendingInfo, warning: resolved.warning ?? null };
+    if (!agentTop.primary) kind = "unconfigured"; // first-run: no primary set yet → run /pivot setup
+    const ruleSignifier = (agentTop.rules ?? config.rules).find((x) => x.modeLabel === resolved.modeLabel)?.signifier ?? null;
+    return { kind, desired: resolved.model, actual: activeModelId, ruleSignifier, resolved,
+             pendingInfo, warning: resolved.warning ?? null,
+             agentOverride: agentTop.matched ? agentTop.primary : null };
   }
 
   // --- statusline pill (live render; shows retry/reconnect during a flip) ---
@@ -265,7 +376,7 @@ export default async function activate(letta) {
     disposers.push(letta.events.on("turn_start", async (event, ctx) => {
       try {
         seam.setMemoryDir(ctx?.memfs?.memoryDir);
-        const v = computeView(ctx?.model?.id);
+        const v = computeView(ctx?.model?.id, agentIdentity(ctx));
         const decision = decideTurn({
           target: v.resolved, currentModelId: ctx?.model?.id, episode,
           memfsEnabled: ctx?.memfs?.enabled === true, honestyMode: config.honesty,
@@ -288,7 +399,8 @@ export default async function activate(letta) {
   const cidOf = (event, ctx) => ctx?.conversation?.id ?? event?.conversationId ?? ctx?.conversationId ?? "default";
   for (const [name, handler] of [
     ["llm_start", (event, ctx) => {
-      stallWatch.markStart({ callId: cidOf(event, ctx), model: event?.model ?? ctx?.model?.id });
+      stallWatch.markStart({ callId: cidOf(event, ctx), model: event?.model ?? ctx?.model?.id,
+                            agentKey: agentPrimary(config, agentIdentity(ctx)).key });
       try { panel?.update?.(); } catch { /* ignore */ }
     }],
     ["llm_end", (event, ctx) => {
@@ -300,9 +412,10 @@ export default async function activate(letta) {
       // watchdog. On 0.27.18/0.27.19 there's no error field (a failed request emits no
       // llm_end), so this cleanly degrades to "benign end = success" and the watchdog stays
       // the detector. See lib/llm-end.mjs.
+      const agentKey = agentPrimary(config, agentIdentity(ctx)).key;
       const { failed, reason } = classifyLlmEnd(event);
-      if (failed) { try { failSeam.report(model, reason); } catch { /* ignore */ } }
-      else noteSuccess(model); // a clean completion clears any suspension on this rung
+      if (failed) { try { failSeam.report(model, reason, agentKey); } catch { /* ignore */ } }
+      else noteSuccess(model, agentKey); // a clean completion clears this agent's suspension
     }],
     ["turn_end", (event, ctx) => { stallWatch.markSettled(cidOf(event, ctx)); }],
   ]) {
@@ -369,7 +482,10 @@ export default async function activate(letta) {
         }
         if (arg === "offline" || arg === "online" || arg === "auto") {
           // Manual online/auto is an explicit "trust the rungs again" → clear stall suspensions.
-          if (arg === "online" || arg === "auto") { for (const idx of [...suspended.keys()]) clearSuspension(idx); }
+          // Clears the WHOLE fleet: "online" is the operator saying "retry
+          // everything", and leaving another agent suspended would be a silent
+          // partial reset.
+          if (arg === "online" || arg === "auto") suspended.clear();
           manual.set(arg);
           state.manualMode = arg;
           try { await saveState(STATE_PATH, state); } catch (e) { log(`state save: ${e?.message ?? e}`); }

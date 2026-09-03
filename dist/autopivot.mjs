@@ -1,11 +1,11 @@
-// index.mjs
+// letta-mods/letta-mod-autopivot/index.mjs
 import { homedir as homedir2 } from "node:os";
 import { join as join2, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 
-// lib/config.mjs
+// letta-mods/letta-mod-autopivot/lib/config.mjs
 var DEFAULT_SIGNIFIERS = {
   online: { glyph: "\u25CF", color: "green", text: "online" },
   // standard green (greenBright is pale)
@@ -165,10 +165,65 @@ function normalizeSignifier(sig, isDegraded) {
     bold: s.bold ?? base.bold ?? false
   };
 }
+function normalizeAgents(raw, warnings) {
+  const out = {};
+  if (raw === void 0) return out;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    warnings.push("`agents` is not an object; ignoring per-agent overrides");
+    return out;
+  }
+  for (const [key, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") {
+      warnings.push(`agents["${key}"]: not an object; ignored`);
+      continue;
+    }
+    if (!value.primary) {
+      warnings.push(`agents["${key}"]: no \`primary\` set; ignored`);
+      continue;
+    }
+    let rules;
+    if (value.rules !== void 0) {
+      if (!Array.isArray(value.rules)) {
+        warnings.push(`agents["${key}"].rules: not an array; using the global rungs`);
+      } else {
+        rules = value.rules.map((r, i) => normalizeRule(r, warnings, `${key}[${i}]`));
+      }
+    }
+    out[key] = {
+      primary: value.primary,
+      contextWindow: value.contextWindow ?? void 0,
+      reasoningEffort: value.reasoningEffort ?? void 0,
+      rules
+    };
+  }
+  return out;
+}
+function agentPrimary(config, identity = {}) {
+  const agents = config?.agents ?? {};
+  const byId = identity.id ? agents[identity.id] : null;
+  const byName = !byId && identity.name ? agents[identity.name] : null;
+  const hit = byId ?? byName ?? null;
+  return {
+    primary: hit?.primary ?? config?.primary ?? null,
+    // The agent's OWN rungs when it has them, else the global list. Returned
+    // alongside the primary so a caller builds one coherent ladder rather than
+    // mixing this agent's top with another's fallbacks.
+    rules: hit?.rules ?? config?.rules ?? [],
+    ownRules: Array.isArray(hit?.rules),
+    key: byId && identity.id || byName && identity.name || null,
+    perMode: hit ? {
+      ...hit.contextWindow !== void 0 ? { contextWindow: hit.contextWindow } : {},
+      ...hit.reasoningEffort !== void 0 ? { reasoningEffort: hit.reasoningEffort } : {}
+    } : {},
+    matched: hit ? byId ? "id" : "name" : null
+  };
+}
 function defaultConfig() {
   return {
     primary: null,
     // user must set their primary model handle
+    agents: {},
+    // optional per-agent primary overrides (see normalizeAgents)
     rules: [],
     reachability: { ...DEFAULT_REACHABILITY },
     networkProbe: { ...DEFAULT_NETWORK_PROBE },
@@ -204,6 +259,7 @@ function parseConfig(text) {
   return {
     config: {
       primary: raw.primary ?? null,
+      agents: normalizeAgents(raw.agents, warnings),
       rules,
       reachability: { ...base.reachability, ...raw.reachability ?? {} },
       networkProbe: { ...base.networkProbe, ...raw.networkProbe ?? {} },
@@ -232,7 +288,7 @@ async function loadConfig(path, deps = {}) {
   return parseConfig(text);
 }
 
-// lib/configure-core.mjs
+// letta-mods/letta-mod-autopivot/lib/configure-core.mjs
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -372,7 +428,7 @@ function buildStarterConfig({ handles = [], providers = [] } = {}) {
   };
 }
 
-// lib/conditions.mjs
+// letta-mods/letta-mod-autopivot/lib/conditions.mjs
 function validateProbeUrl(url) {
   if (!url) return { ok: false, reason: "empty" };
   let u;
@@ -522,7 +578,7 @@ function makeManualCondition(initial = "auto") {
   };
 }
 
-// lib/engine.mjs
+// letta-mods/letta-mod-autopivot/lib/engine.mjs
 function makeEngine(conditions) {
   const subs = /* @__PURE__ */ new Set();
   const emit = () => {
@@ -578,8 +634,8 @@ function makeEngine(conditions) {
   };
 }
 
-// lib/resolver.mjs
-function buildRungs(primary, rules = []) {
+// letta-mods/letta-mod-autopivot/lib/resolver.mjs
+function buildRungs(primary, rules = [], { probeNamespace = "rung" } = {}) {
   const rungs = [{
     index: 0,
     // stable identity for the suspension channel (Phase 3a)
@@ -607,7 +663,7 @@ function buildRungs(primary, rules = []) {
       // always-available terminus (probeId null), while a CLOUD fallback with no probe
       // inherits the brain/"reachability" probe — so "offline" (brain down) gates every
       // cloud rung together and the ladder falls through to the local terminus.
-      probeId: rule?.reachability?.probeUrl ? `rung:${i}` : rule?.target?.local === true ? null : "reachability"
+      probeId: rule?.reachability?.probeUrl ? `${probeNamespace}:${i}` : rule?.target?.local === true ? null : "reachability"
     });
   });
   return rungs;
@@ -642,13 +698,17 @@ function resolveLadder(rungs, health = {}, opts = {}) {
   return noneReachable;
 }
 
-// lib/failure-seam.mjs
+// letta-mods/letta-mod-autopivot/lib/failure-seam.mjs
 function makeFailureSeam() {
   const subs = /* @__PURE__ */ new Set();
   return {
-    /** Report that `rungId` failed. `reason` is opaque (string today, object later). */
-    report(rungId, reason) {
-      const failure = { rungId, reason };
+    /**
+     * Report that `rungId` failed for `agentKey` (null = the global ladder).
+     * The agent travels with the failure because rung indices only mean something
+     * relative to one agent's ladder.
+     */
+    report(rungId, reason, agentKey = null) {
+      const failure = { rungId, reason, agentKey };
       for (const fn of subs) {
         try {
           fn(failure);
@@ -664,7 +724,7 @@ function makeFailureSeam() {
   };
 }
 
-// lib/failure-watch.mjs
+// letta-mods/letta-mod-autopivot/lib/failure-watch.mjs
 function makeStallWatch({ timeoutMs = 9e4, timeoutForModel, onStall, deps = {} } = {}) {
   const setTimer = deps.setTimer ?? ((fn, ms) => {
     const t = setTimeout(fn, ms);
@@ -674,7 +734,7 @@ function makeStallWatch({ timeoutMs = 9e4, timeoutForModel, onStall, deps = {} }
   const clearTimer = deps.clearTimer ?? ((t) => clearTimeout(t));
   const now = deps.now ?? (() => Date.now());
   const inflight = /* @__PURE__ */ new Map();
-  function markStart({ callId, model }) {
+  function markStart({ callId, model, agentKey = null }) {
     if (callId == null) return;
     const prior = inflight.get(callId);
     if (prior) clearTimer(prior.timer);
@@ -683,11 +743,11 @@ function makeStallWatch({ timeoutMs = 9e4, timeoutForModel, onStall, deps = {} }
     const timer = setTimer(() => {
       inflight.delete(callId);
       try {
-        onStall?.(model);
+        onStall?.(model, agentKey);
       } catch {
       }
     }, ms);
-    inflight.set(callId, { model, timer, startedAt: now() });
+    inflight.set(callId, { model, agentKey, timer, startedAt: now() });
   }
   function markSettled(callId) {
     const rec = inflight.get(callId);
@@ -702,7 +762,7 @@ function makeStallWatch({ timeoutMs = 9e4, timeoutForModel, onStall, deps = {} }
   return { markStart, markSettled, stop, _inflightSize: () => inflight.size };
 }
 
-// lib/suspension.mjs
+// letta-mods/letta-mod-autopivot/lib/suspension.mjs
 function modelToRungIndex(rungs, model) {
   if (!model || !Array.isArray(rungs)) return null;
   const rung = rungs.find((r) => r.model === model);
@@ -714,7 +774,47 @@ function canSuspend(rungCount, suspended, index) {
   return next.size < rungCount;
 }
 
-// lib/llm-end.mjs
+// letta-mods/letta-mod-autopivot/lib/rate-limit.mjs
+var RATE_LIMIT_PATTERNS = [
+  /\brate[\s_-]?limit/i,
+  /\btoo many requests\b/i,
+  /\bquota\b/i,
+  /\busage limit\b/i,
+  /\b429\b/
+];
+function isRateLimit(message) {
+  const text = String(message ?? "");
+  return RATE_LIMIT_PATTERNS.some((re) => re.test(text));
+}
+function parseResetsAt(message, now = Date.now()) {
+  const text = String(message ?? "");
+  const rel = text.match(
+    /(?:try again|retry(?:[-\s]after)?|available again|resets?)\s*(?:in)?\s*:?\s*((?:\d+(?:\.\d+)?\s*[hms](?:ours?|in(?:ute)?s?|ec(?:ond)?s?)?\s*)+)/i
+  );
+  if (rel) {
+    let ms = 0;
+    for (const [, n, unit] of rel[1].matchAll(/(\d+(?:\.\d+)?)\s*([hms])/gi)) {
+      const mult = unit.toLowerCase() === "h" ? 36e5 : unit.toLowerCase() === "m" ? 6e4 : 1e3;
+      ms += parseFloat(n) * mult;
+    }
+    if (ms > 0) return now + ms;
+  }
+  const hdr = text.match(/retry[-\s]?after\s*[:=]\s*(\d+)\b/i);
+  if (hdr) return now + Number(hdr[1]) * 1e3;
+  const iso = text.match(/(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)/);
+  if (iso) {
+    const t = Date.parse(iso[1]);
+    if (Number.isFinite(t) && t > now) return t;
+  }
+  return null;
+}
+function classifyRateLimit(reason, now = Date.now()) {
+  const text = reason && typeof reason === "object" ? `${reason.message ?? ""} ${reason.detail ?? ""}` : String(reason ?? "");
+  if (!isRateLimit(text)) return { rateLimited: false, resetsAt: null };
+  return { rateLimited: true, resetsAt: parseResetsAt(text, now) };
+}
+
+// letta-mods/letta-mod-autopivot/lib/llm-end.mjs
 var FAILING_STOP_REASONS = /* @__PURE__ */ new Set(["error", "aborted"]);
 function classifyLlmEnd(event) {
   const err = event?.error;
@@ -744,7 +844,7 @@ function describeReason(reason) {
   return "error";
 }
 
-// lib/turn.mjs
+// letta-mods/letta-mod-autopivot/lib/turn.mjs
 function injectNote(input, note) {
   if (!Array.isArray(input)) return input;
   const out = input.map((m) => ({ ...m }));
@@ -797,7 +897,7 @@ function decideTurn({ target, currentModelId, episode, memfsEnabled, honestyMode
   };
 }
 
-// lib/statusline.mjs
+// letta-mods/letta-mod-autopivot/lib/statusline.mjs
 function colorize(chalk, color, text, bold) {
   if (!chalk) return text;
   let styler;
@@ -855,7 +955,7 @@ function fmt(n) {
   return Number.isInteger(n) ? String(n) : n.toFixed(2);
 }
 
-// lib/status.mjs
+// letta-mods/letta-mod-autopivot/lib/status.mjs
 function buildStatusText({ modeLabel, model, manualMode, conditions, actions }) {
   const lines = [];
   const forced = manualMode && manualMode !== "auto" ? `forced ${manualMode}` : "auto";
@@ -872,7 +972,7 @@ function buildStatusText({ modeLabel, model, manualMode, conditions, actions }) 
   return lines.join("\n");
 }
 
-// lib/state.mjs
+// letta-mods/letta-mod-autopivot/lib/state.mjs
 var VALID_MODES = ["auto", "online", "offline"];
 function validateState(raw) {
   const mode = VALID_MODES.includes(raw?.manualMode) ? raw.manualMode : "auto";
@@ -899,7 +999,7 @@ async function saveState(path, state, deps = {}) {
   write(path, JSON.stringify(validateState(state), null, 2));
 }
 
-// lib/memfs-seam.mjs
+// letta-mods/letta-mod-autopivot/lib/memfs-seam.mjs
 function makeGit(deps) {
   if (deps.exec) return deps.exec;
   return async (args, cwd) => {
@@ -954,7 +1054,7 @@ function makeMemfsSeam(cfg, onReconnect, deps = {}) {
   };
 }
 
-// index.mjs
+// letta-mods/letta-mod-autopivot/index.mjs
 var MOD_DIR = join2(homedir2(), ".letta", "mods");
 var CONFIG_PATH = join2(MOD_DIR, "autopivot.config.json");
 var STATE_PATH = join2(MOD_DIR, "autopivot.state.json");
@@ -997,16 +1097,23 @@ async function activate(letta) {
   const netStaleMs = Math.max(1, (config.networkProbe?.failureThreshold ?? 2) + 1) * (config.networkProbe?.intervalMs ?? 2e4);
   const rungs = buildRungs(config.primary, config.rules);
   const rungProbes = /* @__PURE__ */ new Map();
-  config.rules.forEach((rule, i) => {
-    if (rule?.reachability?.probeUrl) {
-      rungProbes.set(`rung:${i}`, makeProbeCondition(`rung:${i}`, rule.reachability, { onProbe: () => {
+  const addRungProbes = (rules, ns) => {
+    (rules ?? []).forEach((rule, i) => {
+      if (!rule?.reachability?.probeUrl) return;
+      const id = `${ns}:${i}`;
+      if (rungProbes.has(id)) return;
+      rungProbes.set(id, makeProbeCondition(id, rule.reachability, { onProbe: () => {
         try {
           updateUi();
         } catch {
         }
       } }));
-    }
-  });
+    });
+  };
+  addRungProbes(config.rules, "rung");
+  for (const [key, override] of Object.entries(config.agents ?? {})) {
+    if (Array.isArray(override?.rules)) addRungProbes(override.rules, `agent:${key}`);
+  }
   function healthMap() {
     const h = { reachability: reachability.isActive() ? "unreachable" : "available" };
     for (const [id, c] of rungProbes) h[id] = c.isActive() ? "unreachable" : "available";
@@ -1016,7 +1123,28 @@ async function activate(letta) {
   const seam = makeMemfsSeam(config.memorySync, letta.memorySync);
   const stallCfg = config.stall;
   const suspended = /* @__PURE__ */ new Map();
-  const suspendedSet = () => new Set(suspended.keys());
+  const GLOBAL_AGENT = "__global__";
+  const bucket = (agentKey) => {
+    const k = agentKey ?? GLOBAL_AGENT;
+    let b = suspended.get(k);
+    if (!b) {
+      b = /* @__PURE__ */ new Map();
+      suspended.set(k, b);
+    }
+    return b;
+  };
+  const suspendedSet = (agentKey) => {
+    const b = bucket(agentKey);
+    const now = Date.now();
+    for (const [idx, v] of [...b]) {
+      if (v?.until && now >= v.until) b.delete(idx);
+    }
+    return new Set(b.keys());
+  };
+  const anySuspended = () => {
+    for (const k of [...suspended.keys()]) if (suspendedSet(k).size > 0) return true;
+    return false;
+  };
   const failSeam = makeFailureSeam();
   const stallWatch = makeStallWatch({
     timeoutMs: stallCfg.timeoutMs,
@@ -1025,39 +1153,55 @@ async function activate(letta) {
       if (!rung || rung.index === 0) return void 0;
       return config.rules[rung.index - 1]?.stall?.timeoutMs;
     },
-    onStall: (model) => {
+    onStall: (model, agentKey) => {
       try {
-        failSeam.report(model, "stall");
+        failSeam.report(model, "stall", agentKey);
       } catch {
       }
     }
   });
-  const clearSuspension = (idx) => {
-    suspended.delete(idx);
+  const clearSuspension = (idx, agentKey) => {
+    bucket(agentKey).delete(idx);
   };
-  function noteSuccess(model) {
-    const idx = modelToRungIndex(rungs, model);
-    if (idx != null && suspended.has(idx)) {
-      clearSuspension(idx);
+  function ladderFor(agentKey) {
+    const override = agentKey ? config.agents?.[agentKey] : null;
+    if (!override) return rungs;
+    return buildRungs(
+      override.primary ?? config.primary,
+      override.rules ?? config.rules,
+      { probeNamespace: Array.isArray(override.rules) ? `agent:${agentKey}` : "rung" }
+    );
+  }
+  function noteSuccess(model, agentKey) {
+    const idx = modelToRungIndex(ladderFor(agentKey), model);
+    if (idx != null && bucket(agentKey).has(idx)) {
+      clearSuspension(idx, agentKey);
       try {
         updateUi();
       } catch {
       }
     }
   }
-  disposers.push(failSeam.onFailure(({ rungId: model, reason }) => {
+  disposers.push(failSeam.onFailure(({ rungId: model, reason, agentKey }) => {
     try {
-      const idx = modelToRungIndex(rungs, model);
-      if (idx == null) return;
-      if (suspended.has(idx)) return;
+      const ladder = ladderFor(agentKey);
+      const idx = modelToRungIndex(ladder, model);
+      if (idx == null) {
+        log(`failure for off-ladder model ${model} ignored (agent=${agentKey ?? "-"}; ladder: ${ladder.map((r) => r.model).join(", ")})`);
+        return;
+      }
+      if (bucket(agentKey).has(idx)) return;
       const why = reason && typeof reason === "object" ? ` (${describeReason(reason)})` : "";
-      if (!canSuspend(rungs.length, suspendedSet(), idx)) {
+      if (!canSuspend(ladder.length, suspendedSet(agentKey), idx)) {
         announce(`\u26A0\uFE0F AutoPivot: all rungs failing${why} \u2014 staying on ${model}. Run /pivot online to retry.`);
         return;
       }
-      suspended.set(idx, { count: (suspended.get(idx)?.count ?? 0) + 1 });
-      const next = computeView(null).desired;
-      announce(`\u26A0\uFE0F AutoPivot: ${model} failed${why} \u2192 now on ${next ?? "(no model)"}. Resend your message; /pivot online to retry.`);
+      const { rateLimited, resetsAt } = classifyRateLimit(reason);
+      bucket(agentKey).set(idx, { count: (bucket(agentKey).get(idx)?.count ?? 0) + 1, until: resetsAt ?? null });
+      const next = computeView(null, agentKey ? { id: agentKey } : {}).desired;
+      const backIn = resetsAt ? ` ${model} returns automatically in ${Math.max(1, Math.round((resetsAt - Date.now()) / 1e3))}s.` : "";
+      const what = rateLimited ? "rate-limited" : "failed";
+      announce(`\u26A0\uFE0F AutoPivot: ${model} ${what}${why} \u2192 now on ${next ?? "(no model)"}.${backIn} Resend your message; /pivot online to retry.`);
       try {
         updateUi();
       } catch {
@@ -1077,22 +1221,47 @@ async function activate(letta) {
     if (a === null) return networkConfigured ? "unknown" : null;
     return a ? "online" : "offline";
   }
-  function computeView(activeModelId) {
+  function agentIdentity(ctx) {
+    const id = ctx?.agent?.id ?? (String(ctx?.memfs?.memoryDir ?? "").match(/(?:agents|memfs)\/([^/]+)/)?.[1] ?? null);
+    const name = ctx?.agent?.name ?? null;
+    return { id, name };
+  }
+  function computeView(activeModelId, identity = {}) {
     const mode = manual.mode();
-    const resolved = resolveLadder(rungs, healthMap(), { manualMode: mode, suspended: suspendedSet() });
+    const agentTop = agentPrimary(config, identity);
+    const effectiveRungs = agentTop.primary === config.primary && !agentTop.ownRules ? rungs : buildRungs(agentTop.primary, agentTop.rules, {
+      probeNamespace: agentTop.ownRules ? `agent:${agentTop.key}` : "rung"
+    });
+    const resolved = resolveLadder(
+      effectiveRungs,
+      healthMap(),
+      { manualMode: mode, suspended: suspendedSet(agentTop.key) }
+    );
+    if (agentTop.matched && resolved.modeLabel === "primary") {
+      resolved.perMode = { ...resolved.perMode ?? {}, ...agentTop.perMode };
+    }
     const pendingInfo = mode === "auto" && reachability.isPending?.() ? reachability.pendingInfo() : null;
     let kind;
     if (mode === "offline") kind = "forced-offline";
     else if (mode === "online") kind = "forced-online";
     else if (pendingInfo) kind = "checking";
     else if (resolved.kind === "none-reachable") kind = "none-reachable";
-    else if (mode === "auto" && suspended.size > 0) kind = "suspended";
+    else if (mode === "auto" && anySuspended()) kind = "suspended";
     else if (resolved.isDegraded) kind = "offline";
     else if (config.reachability.probeUrl && reachability.isStale(staleMs)) kind = "unknown";
     else kind = "online";
-    if (!config.primary) kind = "unconfigured";
-    const ruleSignifier = config.rules.find((x) => x.modeLabel === resolved.modeLabel)?.signifier ?? null;
-    return { kind, desired: resolved.model, actual: activeModelId, ruleSignifier, resolved, pendingInfo, warning: resolved.warning ?? null };
+    if (!agentTop.primary) kind = "unconfigured";
+    const ruleSignifier = (agentTop.rules ?? config.rules).find((x) => x.modeLabel === resolved.modeLabel)?.signifier ?? null;
+    return {
+      kind,
+      desired: resolved.model,
+      actual: activeModelId,
+      ruleSignifier,
+      resolved,
+      pendingInfo,
+      warning: resolved.warning ?? null,
+      agentOverride: agentTop.matched ? agentTop.primary : null
+    };
   }
   let panel = null;
   if (letta.capabilities?.ui?.panels) {
@@ -1172,7 +1341,7 @@ async function activate(letta) {
     disposers.push(letta.events.on("turn_start", async (event, ctx) => {
       try {
         seam.setMemoryDir(ctx?.memfs?.memoryDir);
-        const v = computeView(ctx?.model?.id);
+        const v = computeView(ctx?.model?.id, agentIdentity(ctx));
         const decision = decideTurn({
           target: v.resolved,
           currentModelId: ctx?.model?.id,
@@ -1197,7 +1366,11 @@ async function activate(letta) {
   const cidOf = (event, ctx) => ctx?.conversation?.id ?? event?.conversationId ?? ctx?.conversationId ?? "default";
   for (const [name, handler] of [
     ["llm_start", (event, ctx) => {
-      stallWatch.markStart({ callId: cidOf(event, ctx), model: event?.model ?? ctx?.model?.id });
+      stallWatch.markStart({
+        callId: cidOf(event, ctx),
+        model: event?.model ?? ctx?.model?.id,
+        agentKey: agentPrimary(config, agentIdentity(ctx)).key
+      });
       try {
         panel?.update?.();
       } catch {
@@ -1206,13 +1379,14 @@ async function activate(letta) {
     ["llm_end", (event, ctx) => {
       stallWatch.markSettled(cidOf(event, ctx));
       const model = event?.model ?? ctx?.model?.id;
+      const agentKey = agentPrimary(config, agentIdentity(ctx)).key;
       const { failed, reason } = classifyLlmEnd(event);
       if (failed) {
         try {
-          failSeam.report(model, reason);
+          failSeam.report(model, reason, agentKey);
         } catch {
         }
-      } else noteSuccess(model);
+      } else noteSuccess(model, agentKey);
     }],
     ["turn_end", (event, ctx) => {
       stallWatch.markSettled(cidOf(event, ctx));
@@ -1288,9 +1462,7 @@ or just edit the file. Then /reload.`;
           }
         }
         if (arg === "offline" || arg === "online" || arg === "auto") {
-          if (arg === "online" || arg === "auto") {
-            for (const idx of [...suspended.keys()]) clearSuspension(idx);
-          }
+          if (arg === "online" || arg === "auto") suspended.clear();
           manual.set(arg);
           state.manualMode = arg;
           try {
